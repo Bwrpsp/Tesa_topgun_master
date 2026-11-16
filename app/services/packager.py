@@ -1,0 +1,132 @@
+import os
+import zipfile
+import shutil
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+
+class SubmissionPackager:
+    """
+    Stage 2: Batch unpacks raw contestant zips, validates required files
+    (infer.py, requirements.txt, weights/*, and auxiliary .py scripts),
+    and creates standardized sanitized bundles ready for Raspberry Pi evaluation.
+    """
+
+    ALLOWED_WEIGHT_EXTS = {".joblib", ".pt", ".pth", ".onnx", ".bin", ".h5", ".pkl", ".tflite", ".engine"}
+    EXCLUDED_PATTERNS = {"__pycache__", ".git", ".venv", "venv", ".idea", ".vscode", ".DS_Store", "outputs"}
+
+    def _find_submission_root(self, extract_dir: Path) -> Optional[Path]:
+        """
+        Locates the directory containing infer.py. Contestants often zip either
+        the contents directly or the parent folder containing them.
+        """
+        for root, _, files in os.walk(extract_dir):
+            if "infer.py" in files:
+                return Path(root)
+        return None
+
+    def _validate_submission(self, sub_root: Path) -> Tuple[bool, Optional[str], Optional[Path]]:
+        """
+        Checks that infer.py, requirements.txt, and weights/ exist and are valid.
+        Returns: (is_valid, error_message, weights_path)
+        """
+        infer_path = sub_root / "infer.py"
+        req_path = sub_root / "requirements.txt"
+        weights_dir = sub_root / "weights"
+
+        if not infer_path.exists():
+            return False, "Missing infer.py", None
+
+        if not req_path.exists():
+            return False, "Missing requirements.txt", None
+
+        # Check weights
+        if not weights_dir.exists() or not weights_dir.is_dir():
+            # Check if weights are at root
+            weight_files = [f for f in sub_root.iterdir() if f.is_file() and f.suffix.lower() in self.ALLOWED_WEIGHT_EXTS]
+            if not weight_files:
+                return False, "Missing weights directory or valid model weight file", None
+            target_weight = weight_files[0]
+        else:
+            weight_files = [f for f in weights_dir.iterdir() if f.is_file() and f.suffix.lower() in self.ALLOWED_WEIGHT_EXTS]
+            if not weight_files:
+                return False, "weights/ folder exists but contains no valid weight files (.joblib, .pt, .onnx, etc.)", None
+            target_weight = weight_files[0]
+
+        return True, None, target_weight
+
+    def _create_clean_bundle(self, sub_root: Path, bundle_zip_path: Path):
+        """
+        Creates a clean, normalized zip file with infer.py, requirements.txt,
+        weights/, and all Python helper modules at root.
+        """
+        with zipfile.ZipFile(bundle_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(sub_root):
+                # Filter out excluded directories
+                dirs[:] = [d for d in dirs if d not in self.EXCLUDED_PATTERNS]
+                
+                rel_root = Path(root).relative_to(sub_root)
+                for file in files:
+                    if file in self.EXCLUDED_PATTERNS:
+                        continue
+                    file_path = Path(root) / file
+                    arcname = str(rel_root / file) if str(rel_root) != "." else file
+                    zf.write(file_path, arcname=arcname)
+
+    def process_team(self, team_id: str, raw_zip: Path, extract_base_dir: Path, bundles_dir: Path) -> Dict[str, any]:
+        extract_dir = extract_base_dir / team_id
+        bundle_file = bundles_dir / f"{team_id}.zip"
+
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(raw_zip, "r") as zf:
+                zf.extractall(extract_dir)
+        except Exception as e:
+            return {"team_id": team_id, "is_valid": False, "error": f"Failed to unzip raw archive: {e}"}
+
+        sub_root = self._find_submission_root(extract_dir)
+        if not sub_root:
+            return {"team_id": team_id, "is_valid": False, "error": "infer.py not found in the archive"}
+
+        is_valid, error, weight_file = self._validate_submission(sub_root)
+        if not is_valid:
+            return {"team_id": team_id, "is_valid": False, "error": error}
+
+        try:
+            self._create_clean_bundle(sub_root, bundle_file)
+            return {
+                "team_id": team_id,
+                "is_valid": True,
+                "bundle_path": str(bundle_file),
+                "weight_file": weight_file.name if weight_file else "unknown"
+            }
+        except Exception as e:
+            return {"team_id": team_id, "is_valid": False, "error": f"Failed to create bundle zip: {e}"}
+
+    def process_all_for_day(self, raw_zips_dir: Path, extracted_dir: Path, bundles_dir: Path) -> Dict[str, any]:
+        """Processes all downloaded zips for the given day."""
+        bundles_dir.mkdir(parents=True, exist_ok=True)
+        extracted_dir.mkdir(parents=True, exist_ok=True)
+
+        results = []
+        valid_count = 0
+        invalid_count = 0
+
+        for raw_zip in raw_zips_dir.glob("*.zip"):
+            team_id = raw_zip.stem
+            res = self.process_team(team_id, raw_zip, extracted_dir, bundles_dir)
+            if res["is_valid"]:
+                valid_count += 1
+            else:
+                invalid_count += 1
+            results.append(res)
+
+        return {
+            "total_processed": len(results),
+            "valid": valid_count,
+            "invalid": invalid_count,
+            "details": results
+        }
