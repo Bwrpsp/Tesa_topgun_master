@@ -38,7 +38,7 @@ class JobPollResponse(BaseModel):
 class JobReturnRequest(BaseModel):
     slave_id: str
     status: str  # "SUCCESS" or "FAILED"
-    predictions: Optional[List[Dict[str, Any]]] = None
+    predictions: Optional[Any] = None  # List of CSV rows for Day 1, or JSON (list/dict) for Day 2/3
     timings: Optional[List[Dict[str, Any]]] = None
     benchmark: Optional[Dict[str, Any]] = None
     total_wall_time_s: Optional[float] = None
@@ -48,15 +48,37 @@ class JobReturnRequest(BaseModel):
 
 
 class EvaluationScore(BaseModel):
+    day: int = 1
     total_images: int = 0
+
+    # Day 1: Simple Classification (count correct pics)
     correct_predictions: int = 0
     accuracy: float = 0.0
     macro_f1: float = 0.0
+
+    # Day 2: Binary Object Masking (IoU >= 0.95, TP, FP, FN, F1)
+    tp: int = 0
+    fp: int = 0
+    fn: int = 0
+    precision: float = 0.0
+    recall: float = 0.0
+    f1_score: float = 0.0
+    mean_iou: float = 0.0
+    iou_threshold: float = 0.95
+
+    # Day 3: Masking + Classification (mAP@95)
+    map_95: float = 0.0
+    class_accuracy: float = 0.0
+
+    # Latency / Timing metrics
     mean_processing_seconds: float = 0.0
     mean_total_seconds: float = 0.0
     model_load_seconds: float = 0.0
     total_wall_time_s: float = 0.0
+
+    # Final combined / weighted score
     composite_score: float = 0.0
+    details: Optional[Dict[str, Any]] = None
 
 
 class Job(BaseModel):

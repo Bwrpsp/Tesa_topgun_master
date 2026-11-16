@@ -52,8 +52,19 @@ class Settings(BaseSettings):
     def get_contestants_csv(self, day: int) -> Path:
         return self.get_day_data_dir(day) / "contestants.csv"
 
+    def get_ground_truth_path(self, day: int) -> Path:
+        day_dir = self.get_day_data_dir(day)
+        json_path = day_dir / "ground_truth.json"
+        csv_path = day_dir / "ground_truth.csv"
+        if json_path.exists():
+            return json_path
+        if csv_path.exists():
+            return csv_path
+        # Default based on day
+        return json_path if day in (2, 3) else csv_path
+
     def get_ground_truth_csv(self, day: int) -> Path:
-        return self.get_day_data_dir(day) / "ground_truth.csv"
+        return self.get_ground_truth_path(day)
 
     def get_raw_zips_dir(self, day: int) -> Path:
         path = self.get_day_data_dir(day) / "raw_zips"

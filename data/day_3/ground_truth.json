@@ -1,0 +1,20 @@
+[
+  {
+    "filename": "image_001.jpg",
+    "objects": [
+      {
+        "class": "good",
+        "polygon": [[10, 10], [50, 10], [50, 50], [10, 50]]
+      }
+    ]
+  },
+  {
+    "filename": "image_002.jpg",
+    "objects": [
+      {
+        "class": "full_black",
+        "polygon": [[100, 100], [200, 100], [200, 200], [100, 200]]
+      }
+    ]
+  }
+]

@@ -75,10 +75,11 @@ async def return_job_result(job_id: str, payload: JobReturnRequest):
 
     evaluation = None
     if payload.status.upper() == "SUCCESS":
-        gt_path = settings.get_ground_truth_csv(job.day)
+        gt_path = settings.get_ground_truth_path(job.day)
         if gt_path.exists():
             try:
                 evaluation = evaluator.evaluate(
+                    day=job.day,
                     ground_truth_path=gt_path,
                     predictions=payload.predictions,
                     timings=payload.timings,
@@ -91,13 +92,7 @@ async def return_job_result(job_id: str, payload: JobReturnRequest):
                 payload.error_message = f"Evaluation scoring error: {e}"
         else:
             # If ground truth is not uploaded yet, compute latency metrics only
-            evaluation = evaluator.evaluate(
-                ground_truth_path=Path(""),
-                predictions=None,
-                timings=payload.timings,
-                benchmark=payload.benchmark,
-                total_wall_time_s=payload.total_wall_time_s
-            ) if payload.benchmark or payload.timings else None
+            evaluation = None
 
     # Update job status in queue
     updated_job = queue_manager.complete_job(job_id, payload, evaluation)

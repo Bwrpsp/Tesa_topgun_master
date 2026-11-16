@@ -6,12 +6,15 @@ Central orchestrator for the distributed evaluation system. Manages high-speed p
 
 ## Features
 
-- **Dynamic 3-Day Competition Pipeline:** Separate data and ground truth configurations for Day 1, Day 2, and Day 3.
+- **Dynamic 3-Day Competition Pipeline:** Separate data, ground truth, and scoring rules for each day:
+  - **Day 1 (Classification - CSV):** Simple image classification. Counts correct images (`correct_pics`), evaluates exact-match Accuracy (`correct / total`), Macro F1, and Latency.
+  - **Day 2 (1-Class Masking - JSON):** Binary object segmentation. Calculates pixel/polygon IoU with a $\ge 0.95$ threshold, evaluates True Positives (TP), False Positives (FP), False Negatives (FN), Precision, Recall, and F1-score.
+  - **Day 3 (Combined Masking + Multi-Class Classification - JSON):** Evaluates object segmentation matched with correct class labels using $\text{mAP@95}$, Class Accuracy, and composite score.
 - **High-Speed Two-Stage Downloader:**
   - *Stage 1:* Concurrent parallel downloads of all raw `.zip` archives directly from Google Drive / links.
   - *Stage 2:* Batch extraction, validation (`infer.py`, `requirements.txt`, `weights/`), and bundling.
 - **FastAPI Core:** Interactive Swagger UI at `/docs`, REST endpoints for Pi slaves, and dynamic leaderboard generation.
-- **Leaderboard Aggregation:** Instant scoring (Accuracy, Macro F1, Model Load Time, Average Latency) and automatic export to `final_leaderboard.csv`.
+- **Leaderboard Aggregation:** Instant scoring tailored per day and automatic export to `final_leaderboard.csv`.
 
 ---
 
