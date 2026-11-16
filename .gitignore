@@ -55,3 +55,5 @@ results/*
 *.swo
 .DS_Store
 Thumbs.db
+ground_truth.csv
+ground_truth.json
