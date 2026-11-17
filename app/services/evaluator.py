@@ -127,6 +127,12 @@ class SubmissionEvaluator:
             return EvaluationScore(day=1, total_images=0, mean_processing_seconds=mean_p,
                                    mean_total_seconds=mean_t, model_load_seconds=load_s, total_wall_time_s=wall_s)
 
+        def clean_label(label: str) -> str:
+            lbl = str(label).strip().lower()
+            if lbl in ("black", "full_black"):
+                return "full_black"
+            return lbl
+
         # Load CSV ground truth
         gt = {}
         with open(ground_truth_path, mode="r", encoding="utf-8-sig") as f:
@@ -136,17 +142,24 @@ class SubmissionEvaluator:
                 fname = cleaned.get("filename") or cleaned.get("file") or cleaned.get("name")
                 label = cleaned.get("class") or cleaned.get("label") or cleaned.get("target")
                 if fname and label:
-                    gt[fname] = label
+                    gt[fname] = clean_label(label)
 
-        pred_map = {p.get("filename", ""): str(p.get("class") or p.get("label", "")) for p in predictions if p.get("filename")}
+        pred_map = {}
+        if isinstance(predictions, list):
+            for p in predictions:
+                if isinstance(p, dict):
+                    fn = p.get("filename", "")
+                    cl = p.get("class") or p.get("label", "")
+                    if fn:
+                        pred_map[fn] = clean_label(cl)
 
         y_true, y_pred = [], []
         correct_count = 0
-        for filename, true_label in gt.items():
-            pred_label = pred_map.get(filename, "__MISSING__")
-            y_true.append(true_label)
-            y_pred.append(pred_label)
-            if pred_label == true_label:
+        for filename, true_clean in gt.items():
+            pred_clean = pred_map.get(filename, "__MISSING__")
+            y_true.append(true_clean)
+            y_pred.append(pred_clean)
+            if pred_clean == true_clean:
                 correct_count += 1
 
         total_images = len(gt)

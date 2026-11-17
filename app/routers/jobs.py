@@ -14,7 +14,7 @@ evaluator = SubmissionEvaluator()
 
 
 @router.get("/poll", response_model=Optional[JobPollResponse])
-async def poll_for_job(
+def poll_for_job(
     slave_id: str = Query(..., description="Unique hostname or identifier of the Raspberry Pi"),
     current_temp: Optional[float] = Query(None, description="Current CPU temperature of Pi"),
     throttled_flag: Optional[str] = Query("0x0", description="Current vcgencmd throttled hex string")
@@ -42,7 +42,7 @@ async def poll_for_job(
 
 
 @router.get("/{job_id}/bundle")
-async def download_bundle(job_id: str):
+def download_bundle(job_id: str):
     """
     Slaves download the sanitized contestant bundle zip (containing infer.py,
     requirements.txt, weights/, and custom python modules).
@@ -63,7 +63,7 @@ async def download_bundle(job_id: str):
 
 
 @router.post("/{job_id}/return")
-async def return_job_result(job_id: str, payload: JobReturnRequest):
+def return_job_result(job_id: str, payload: JobReturnRequest):
     """
     Slaves post back execution outputs, timings, benchmark.json, logs, and hardware stats.
     Evaluator automatically scores predictions against the day's ground truth and
@@ -96,11 +96,16 @@ async def return_job_result(job_id: str, payload: JobReturnRequest):
 
     # Update job status in queue
     updated_job = queue_manager.complete_job(job_id, payload, evaluation)
+    if not updated_job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} could not be updated")
 
-    # Immediately regenerate leaderboard CSV for this day
-    day_jobs = [j for j in queue_manager.jobs.get(job.day, {}).values()]
-    leaderboard_csv = settings.get_leaderboard_csv(job.day)
-    aggregator.generate_leaderboard(day_jobs, leaderboard_csv)
+    # Regenerate leaderboard CSV for this day safely
+    try:
+        day_jobs = [j for j in queue_manager.jobs.get(job.day, {}).values()]
+        leaderboard_csv = settings.get_leaderboard_csv(job.day)
+        aggregator.generate_leaderboard(day_jobs, leaderboard_csv)
+    except Exception as e:
+        print(f"[Warning] Failed to write leaderboard CSV: {e}")
 
     return {
         "message": f"Job {job_id} recorded successfully",

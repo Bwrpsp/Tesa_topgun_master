@@ -2,15 +2,20 @@
 CLI entry point to run the master server or pipeline tasks directly.
 
 Usage:
-    python run_master.py serve                      # Start FastAPI server
-    python run_master.py download --day 1          # Bulk download raw zips for Day 1
-    python run_master.py prepare --day 1           # Batch unpack, validate, and prepare queue
+    python run_master.py serve                            # Start FastAPI server
+    python run_master.py download --day 1                # Sequential, verbose download
+    python run_master.py download --day 1 --skip-existing # Skip already downloaded files
+    python run_master.py download --day 1 --parallel     # Concurrent download
+    python run_master.py prepare --day 1                 # Batch unpack, validate, and prepare queue
 """
 import argparse
 import asyncio
 import sys
 from pathlib import Path
 import uvicorn
+
+# Ensure master directory is on sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.config import settings
 from app.services.downloader import HighSpeedDownloader
@@ -28,20 +33,32 @@ def serve():
     )
 
 
-def download_cli(day: int):
+def download_cli(day: int, parallel: bool = False, verbose: bool = True, skip_existing: bool = False):
     csv_path = settings.get_contestants_csv(day)
     raw_dir = settings.get_raw_zips_dir(day)
-    print(f"[Day {day}] Reading contestants from {csv_path} ...")
-    print(f"[Day {day}] Downloading all archives concurrently into {raw_dir} ...")
 
     downloader = HighSpeedDownloader(
         max_concurrent=settings.DOWNLOAD_MAX_CONCURRENT,
         timeout_seconds=settings.DOWNLOAD_TIMEOUT_SECONDS
     )
-    result = asyncio.run(downloader.download_all(csv_path, raw_dir))
-    print(f"[Day {day}] Bulk Download Complete! Total: {result['total']}, Success: {result['completed']}, Failed: {result['failed']}")
-    if result["errors"]:
-        print("Failed details:", result["errors"])
+
+    if not parallel:
+        downloader.download_sequential(csv_path, raw_dir, verbose=verbose, skip_existing=skip_existing)
+    else:
+        print(f"[Day {day}] Reading contestants from {csv_path} ...")
+        print(f"[Day {day}] Downloading all archives concurrently into {raw_dir} ...")
+        result = asyncio.run(
+            downloader.download_all(
+                csv_path,
+                raw_dir,
+                parallel=True,
+                verbose=verbose,
+                skip_existing=skip_existing
+            )
+        )
+        print(f"[Day {day}] Download Complete! Total: {result['total']}, Success: {result['completed']}, Failed: {result['failed']}")
+        if result["errors"]:
+            print("Failed details:", result["errors"])
 
 
 def prepare_cli(day: int):
@@ -58,6 +75,44 @@ def prepare_cli(day: int):
         print(f"  - {d['team_id']}: {status_str}")
 
 
+def retry_failed_cli(day: int):
+    leaderboard_csv = settings.get_leaderboard_csv(day)
+    bundles_dir = settings.get_bundles_dir(day)
+
+    if not leaderboard_csv.exists():
+        print(f"[Error] final_leaderboard.csv not found at {leaderboard_csv}")
+        return
+
+    # Try communicating with running master server first
+    import httpx
+    endpoint_url = f"http://{settings.MASTER_HOST}:{settings.MASTER_PORT}/api/v1/admin/day/{day}/retry-failed"
+    try:
+        resp = httpx.post(endpoint_url, timeout=10.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"[Day {day}] Success! Requeued {data['requeued_count']} failed jobs in running Master Server.")
+            print(f"  - Preserved Completed Jobs: {data['completed_preserved_count']}")
+            print(f"  - Requeued to Retry: {data['requeued_count']}")
+            if data["missing_bundle_count"] > 0:
+                print(f"  - Warning: {data['missing_bundle_count']} jobs had missing bundle archives.")
+            for rj in data["requeued_jobs"]:
+                print(f"    * {rj['job_id']} ({rj['team_name']})")
+            return
+    except Exception:
+        pass
+
+    # If server is not running, run directly against queue_manager
+    report = queue_manager.requeue_failed_from_leaderboard(day, leaderboard_csv, bundles_dir)
+    print(f"[Day {day}] Requeued {report['requeued_count']} failed jobs from {leaderboard_csv.name}.")
+    print(f"  - Preserved Completed Jobs: {report['completed_preserved_count']}")
+    print(f"  - Requeued to Retry: {report['requeued_count']}")
+    if report["missing_bundle_count"] > 0:
+        print(f"  - Warning: {report['missing_bundle_count']} jobs had missing bundle archives.")
+    for rj in report["requeued_jobs"]:
+        print(f"    * {rj['job_id']} ({rj['team_name']})")
+    print("\nNote: Master server was not running. Start it with 'python run_master.py serve' to serve slaves.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TESA Master Orchestrator CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -66,21 +121,68 @@ def main():
     subparsers.add_parser("serve", help="Start the FastAPI server")
 
     # Download command
-    dl_parser = subparsers.add_parser("download", help="Run bulk parallel download")
-    dl_parser.add_argument("--day", type=int, choices=[1, 2, 3], default=settings.ACTIVE_DAY, help="Competition day")
+    dl_parser = subparsers.add_parser("download", help="Download contestant submissions")
+    dl_parser.add_argument(
+        "--day",
+        type=int,
+        choices=[1, 2, 3],
+        default=settings.ACTIVE_DAY,
+        help="Competition day (default: 1)"
+    )
+    dl_parser.add_argument(
+        "--parallel",
+        action="store_true",
+        default=False,
+        help="Run concurrent downloads instead of sequential (default: False)"
+    )
+    dl_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        default=False,
+        help="Suppress detailed download progress and bars"
+    )
+    dl_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=False,
+        help="Skip files that already exist on disk"
+    )
 
     # Prepare command
     prep_parser = subparsers.add_parser("prepare", help="Unpack, validate and prepare bundles")
-    prep_parser.add_argument("--day", type=int, choices=[1, 2, 3], default=settings.ACTIVE_DAY, help="Competition day")
+    prep_parser.add_argument(
+        "--day",
+        type=int,
+        choices=[1, 2, 3],
+        default=settings.ACTIVE_DAY,
+        help="Competition day"
+    )
+
+    # Retry-failed command
+    retry_parser = subparsers.add_parser("retry-failed", help="Requeue failed jobs from final_leaderboard.csv")
+    retry_parser.add_argument(
+        "--day",
+        type=int,
+        choices=[1, 2, 3],
+        default=settings.ACTIVE_DAY,
+        help="Competition day (default: 1)"
+    )
 
     args = parser.parse_args()
 
     if args.command == "serve":
         serve()
     elif args.command == "download":
-        download_cli(args.day)
+        download_cli(
+            day=args.day,
+            parallel=args.parallel,
+            verbose=not args.quiet,
+            skip_existing=args.skip_existing
+        )
     elif args.command == "prepare":
         prepare_cli(args.day)
+    elif args.command == "retry-failed":
+        retry_failed_cli(args.day)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,6 @@ class SubmissionPackager:
     and creates standardized sanitized bundles ready for Raspberry Pi evaluation.
     """
 
-    ALLOWED_WEIGHT_EXTS = {".joblib", ".pt", ".pth", ".onnx", ".bin", ".h5", ".pkl", ".tflite", ".engine"}
     EXCLUDED_PATTERNS = {"__pycache__", ".git", ".venv", "venv", ".idea", ".vscode", ".DS_Store", "outputs"}
 
     def _find_submission_root(self, extract_dir: Path) -> Optional[Path]:
@@ -25,35 +24,33 @@ class SubmissionPackager:
                 return Path(root)
         return None
 
-    def _validate_submission(self, sub_root: Path) -> Tuple[bool, Optional[str], Optional[Path]]:
+    def _validate_submission(self, sub_root: Path) -> Tuple[bool, Optional[str], Optional[Path], List[str]]:
         """
-        Checks that infer.py, requirements.txt, and weights/ exist and are valid.
-        Returns: (is_valid, error_message, weights_path)
+        Checks that infer.py, requirements.txt, and weights/ folder exist and are valid.
+        Accepts ANY file type/format inside weights/ as long as the folder is present and non-empty.
+        Returns: (is_valid, error_message, weights_dir, list_of_weight_filenames)
         """
         infer_path = sub_root / "infer.py"
         req_path = sub_root / "requirements.txt"
         weights_dir = sub_root / "weights"
 
         if not infer_path.exists():
-            return False, "Missing infer.py", None
+            return False, "Missing infer.py", None, []
 
         if not req_path.exists():
-            return False, "Missing requirements.txt", None
+            return False, "Missing requirements.txt", None, []
 
-        # Check weights
+        # Check weights folder exists
         if not weights_dir.exists() or not weights_dir.is_dir():
-            # Check if weights are at root
-            weight_files = [f for f in sub_root.iterdir() if f.is_file() and f.suffix.lower() in self.ALLOWED_WEIGHT_EXTS]
-            if not weight_files:
-                return False, "Missing weights directory or valid model weight file", None
-            target_weight = weight_files[0]
-        else:
-            weight_files = [f for f in weights_dir.iterdir() if f.is_file() and f.suffix.lower() in self.ALLOWED_WEIGHT_EXTS]
-            if not weight_files:
-                return False, "weights/ folder exists but contains no valid weight files (.joblib, .pt, .onnx, etc.)", None
-            target_weight = weight_files[0]
+            return False, "Missing required 'weights' directory", None, []
 
-        return True, None, target_weight
+        # Check that weights folder is not empty (accepts any file type/extension)
+        weight_files = [f for f in weights_dir.rglob("*") if f.is_file()]
+        if not weight_files:
+            return False, "'weights' directory exists but is empty (no files found)", None, []
+
+        weight_names = [f.name for f in weight_files]
+        return True, None, weights_dir, weight_names
 
     def _create_clean_bundle(self, sub_root: Path, bundle_zip_path: Path):
         """
@@ -91,7 +88,7 @@ class SubmissionPackager:
         if not sub_root:
             return {"team_id": team_id, "is_valid": False, "error": "infer.py not found in the archive"}
 
-        is_valid, error, weight_file = self._validate_submission(sub_root)
+        is_valid, error, weights_dir, weight_names = self._validate_submission(sub_root)
         if not is_valid:
             return {"team_id": team_id, "is_valid": False, "error": error}
 
@@ -101,7 +98,9 @@ class SubmissionPackager:
                 "team_id": team_id,
                 "is_valid": True,
                 "bundle_path": str(bundle_file),
-                "weight_file": weight_file.name if weight_file else "unknown"
+                "weights_dir": "weights",
+                "weights_count": len(weight_names),
+                "weight_files": weight_names
             }
         except Exception as e:
             return {"team_id": team_id, "is_valid": False, "error": f"Failed to create bundle zip: {e}"}
