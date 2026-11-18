@@ -56,7 +56,16 @@ class EvaluationScore(BaseModel):
     accuracy: float = 0.0
     macro_f1: float = 0.0
 
-    # Day 2: Binary Object Masking (IoU >= 0.95, TP, FP, FN, F1)
+    # Day 2: Object Masking & Counting (latency, count, iou95, iou90, iou_average)
+    count_accuracy: float = 0.0
+    iou95: int = 0
+    iou90: int = 0
+    iou_average: float = 0.0
+    latency: float = 0.0
+    total_gt_objects: int = 0
+    total_pred_objects: int = 0
+
+    # Day 2 & 3: Binary Object Masking (IoU >= 0.95, TP, FP, FN, F1)
     tp: int = 0
     fp: int = 0
     fn: int = 0

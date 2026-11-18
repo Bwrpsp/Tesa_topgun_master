@@ -24,7 +24,13 @@ class LeaderboardAggregator:
                 # Day 1 metrics
                 "correct_pics": f"{eval_score.correct_predictions}/{eval_score.total_images}" if (eval_score and job.day == 1) else "",
                 "accuracy": eval_score.accuracy if eval_score else 0.0,
-                # Day 2 & 3 metrics
+                # Day 2 metrics
+                "count": f"{eval_score.count_accuracy:.2f}%" if (eval_score and job.day == 2) else "",
+                "iou95": eval_score.iou95 if eval_score else 0,
+                "iou90": eval_score.iou90 if eval_score else 0,
+                "iou_average": eval_score.iou_average if eval_score else 0.0,
+                "latency": eval_score.latency if (eval_score and job.day == 2) else (eval_score.total_wall_time_s if eval_score else 0.0),
+                # Day 2 & 3 legacy/detailed metrics
                 "tp": eval_score.tp if eval_score else 0,
                 "fp": eval_score.fp if eval_score else 0,
                 "fn": eval_score.fn if eval_score else 0,
@@ -34,7 +40,7 @@ class LeaderboardAggregator:
                 "mean_iou": eval_score.mean_iou if (eval_score and job.day in (2, 3)) else 0.0,
                 "map_95": eval_score.map_95 if (eval_score and job.day == 3) else 0.0,
                 "class_accuracy": eval_score.class_accuracy if (eval_score and job.day == 3) else 0.0,
-                # Latency metrics
+                # Latency / timing metrics
                 "mean_processing_s": eval_score.mean_processing_seconds if eval_score else 0.0,
                 "mean_total_s": eval_score.mean_total_seconds if eval_score else 0.0,
                 "model_load_s": eval_score.model_load_seconds if eval_score else 0.0,
@@ -49,10 +55,27 @@ class LeaderboardAggregator:
             }
             rows.append(row)
 
-        # Sort: COMPLETED first, then by composite_score DESC, f1_score DESC, mean_processing_s ASC
+        sample_day = jobs[0].day if jobs else 1
+
+        # Sort: COMPLETED first, then metrics based on competition day
         def sort_key(item):
             is_completed = 1 if item["status"] == JobStatus.COMPLETED.value else 0
-            return (is_completed, item["composite_score"], item["f1_score"], -item["mean_processing_s"])
+            if sample_day == 2:
+                c_score = float(item.get("composite_score") or 0.0)
+                iou95 = float(item.get("iou95") or 0.0)
+                iou90 = float(item.get("iou90") or 0.0)
+                lat = float(item.get("latency") or 999999.0)
+                return (is_completed, c_score, iou95, iou90, -lat)
+            elif sample_day == 1:
+                c_score = float(item.get("composite_score") or 0.0)
+                acc = float(item.get("accuracy") or 0.0)
+                wall = float(item.get("total_wall_time_s") or 999999.0)
+                return (is_completed, c_score, acc, -wall)
+            else:
+                c_score = float(item.get("composite_score") or 0.0)
+                f1 = float(item.get("f1_score") or 0.0)
+                proc = float(item.get("mean_processing_s") or 999999.0)
+                return (is_completed, c_score, f1, -proc)
 
         rows.sort(key=sort_key, reverse=True)
 
@@ -66,7 +89,6 @@ class LeaderboardAggregator:
                 row["rank"] = "-"
 
         # Determine fieldnames dynamically based on the day
-        sample_day = jobs[0].day if jobs else 1
         if sample_day == 1:
             fieldnames = [
                 "rank", "team_name", "status", "composite_score", "correct_pics", "accuracy",
@@ -75,9 +97,7 @@ class LeaderboardAggregator:
             ]
         elif sample_day == 2:
             fieldnames = [
-                "rank", "team_name", "status", "composite_score", "f1_score", "precision", "recall",
-                "mean_iou", "tp", "fp", "fn",
-                "mean_processing_s", "mean_total_s", "model_load_s", "total_wall_time_s",
+                "rank", "team_name", "status", "composite_score", "count", "iou95", "iou90", "iou_average", "latency",
                 "slave_id", "start_temp", "end_temp", "throttled_flag", "job_id", "day", "error_message"
             ]
         else:  # Day 3

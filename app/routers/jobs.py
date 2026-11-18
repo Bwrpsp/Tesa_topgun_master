@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
@@ -16,15 +17,16 @@ evaluator = SubmissionEvaluator()
 @router.get("/poll", response_model=Optional[JobPollResponse])
 def poll_for_job(
     slave_id: str = Query(..., description="Unique hostname or identifier of the Raspberry Pi"),
+    day: Optional[int] = Query(None, description="Optional competition day override (1, 2, or 3)"),
     current_temp: Optional[float] = Query(None, description="Current CPU temperature of Pi"),
     throttled_flag: Optional[str] = Query("0x0", description="Current vcgencmd throttled hex string")
 ):
     """
     Slaves poll this endpoint continuously to receive evaluation tasks.
-    If a job is ready for the current active day, returns 200 with job payload.
+    If a job is ready for the requested (or active) day, returns 200 with job payload.
     If no jobs are queued, returns 204 No Content.
     """
-    active_day = settings.ACTIVE_DAY
+    active_day = day if (day is not None and day in (1, 2, 3)) else settings.ACTIVE_DAY
     job = queue_manager.poll_job(day=active_day, slave_id=slave_id)
 
     if not job:
@@ -98,6 +100,21 @@ def return_job_result(job_id: str, payload: JobReturnRequest):
     updated_job = queue_manager.complete_job(job_id, payload, evaluation)
     if not updated_job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} could not be updated")
+
+    # Save contestant raw predictions output
+    if payload.predictions is not None:
+        try:
+            preds_dir = settings.get_day_results_dir(job.day) / "predictions"
+            preds_dir.mkdir(parents=True, exist_ok=True)
+            out_file = preds_dir / f"{job_id}_predictions.json"
+            if isinstance(payload.predictions, (dict, list)):
+                with open(out_file, mode="w", encoding="utf-8") as f:
+                    json.dump(payload.predictions, f, indent=2)
+            elif isinstance(payload.predictions, str):
+                with open(out_file, mode="w", encoding="utf-8") as f:
+                    f.write(payload.predictions)
+        except Exception as e:
+            print(f"[Warning] Failed to save raw predictions for {job_id}: {e}")
 
     # Regenerate leaderboard CSV for this day safely
     try:

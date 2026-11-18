@@ -48,12 +48,30 @@ class QueueManager:
             correct = self._int_or_default(parts[0])
             total_imgs = self._int_or_default(parts[1])
 
+        # Day 2 fields: count ("85.71%"), iou95, iou90, iou_average, latency
+        count_raw = str(row.get("count", "")).replace("%", "").strip()
+        count_acc = self._float_or_default(count_raw) if count_raw else 0.0
+
+        iou95_raw = str(row.get("iou95", "")).split("/")[0].strip()
+        iou95_val = self._int_or_default(iou95_raw)
+
+        iou90_raw = str(row.get("iou90", "")).split("/")[0].strip()
+        iou90_val = self._int_or_default(iou90_raw)
+
+        iou_avg = self._float_or_default(row.get("iou_average"))
+        lat = self._float_or_default(row.get("latency", row.get("total_wall_time_s")))
+
         return EvaluationScore(
             day=day,
             total_images=total_imgs,
             correct_predictions=correct,
             accuracy=self._float_or_default(row.get("accuracy")),
             macro_f1=self._float_or_default(row.get("f1_score")),
+            count_accuracy=count_acc,
+            iou95=iou95_val,
+            iou90=iou90_val,
+            iou_average=iou_avg,
+            latency=lat,
             tp=self._int_or_default(row.get("tp")),
             fp=self._int_or_default(row.get("fp")),
             fn=self._int_or_default(row.get("fn")),
@@ -66,7 +84,7 @@ class QueueManager:
             mean_processing_seconds=self._float_or_default(row.get("mean_processing_s")),
             mean_total_seconds=self._float_or_default(row.get("mean_total_s")),
             model_load_seconds=self._float_or_default(row.get("model_load_s")),
-            total_wall_time_s=self._float_or_default(row.get("total_wall_time_s")),
+            total_wall_time_s=self._float_or_default(row.get("total_wall_time_s", lat)),
             composite_score=self._float_or_default(row.get("composite_score"))
         )
 

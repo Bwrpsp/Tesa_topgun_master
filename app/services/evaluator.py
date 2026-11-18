@@ -3,9 +3,146 @@ import json
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
 import numpy as np
+import cv2
+from scipy.optimize import linear_sum_assignment
 from PIL import Image, ImageDraw
 from sklearn.metrics import f1_score, accuracy_score
 from app.models.job import EvaluationScore
+
+
+def _normalize_image_key(name: Any) -> str:
+    """Normalizes image filenames/paths to lower-case stem for consistent matching."""
+    s = str(name).strip()
+    return Path(s).stem.lower()
+
+
+def normalize_polygon(poly_data: Any) -> Optional[np.ndarray]:
+    """
+    Converts any polygon representation into an (N, 2) numpy array of int32 coordinates.
+    Requires at least 3 points.
+    """
+    if poly_data is None:
+        return None
+
+    if isinstance(poly_data, np.ndarray):
+        if poly_data.ndim == 2 and poly_data.shape[1] == 2:
+            pts = poly_data.astype(np.int32)
+            return pts if len(pts) >= 3 else None
+        elif poly_data.ndim == 1 and len(poly_data) >= 6 and len(poly_data) % 2 == 0:
+            pts = poly_data.reshape(-1, 2).astype(np.int32)
+            return pts if len(pts) >= 3 else None
+
+    if isinstance(poly_data, list):
+        if not poly_data:
+            return None
+        first = poly_data[0]
+        if isinstance(first, (list, tuple)) and len(first) >= 2:
+            try:
+                pts = np.array([[int(round(float(p[0]))), int(round(float(p[1])))] for p in poly_data], dtype=np.int32)
+                return pts if len(pts) >= 3 else None
+            except Exception:
+                return None
+        elif isinstance(first, (int, float)):
+            if len(poly_data) >= 6 and len(poly_data) % 2 == 0:
+                try:
+                    pts = np.array([[int(round(float(poly_data[i]))), int(round(float(poly_data[i + 1])))] for i in range(0, len(poly_data), 2)], dtype=np.int32)
+                    return pts if len(pts) >= 3 else None
+                except Exception:
+                    return None
+    return None
+
+
+def extract_polygon(obj: Any) -> Optional[np.ndarray]:
+    """Extracts a valid polygon coordinate array from various object dictionary or list shapes."""
+    if isinstance(obj, dict):
+        poly = obj.get("polygon") or obj.get("segmentation") or obj.get("mask") or obj.get("points")
+        if poly is not None:
+            return normalize_polygon(poly)
+    elif isinstance(obj, (list, np.ndarray)):
+        return normalize_polygon(obj)
+    return None
+
+
+def compute_polygon_iou(p1: np.ndarray, p2: np.ndarray) -> float:
+    """
+    Computes exact rasterized Intersection-over-Union (IoU) between two polygons
+    using an optimized local sub-canvas bounding box.
+    """
+    min_x1, min_y1 = p1.min(axis=0)
+    max_x1, max_y1 = p1.max(axis=0)
+    min_x2, min_y2 = p2.min(axis=0)
+    max_x2, max_y2 = p2.max(axis=0)
+
+    # Fast rejection via bounding box overlap
+    if max_x1 < min_x2 or max_x2 < min_x1 or max_y1 < min_y2 or max_y2 < min_y1:
+        return 0.0
+
+    # Local canvas on bounding box union
+    u_min_x = int(min(min_x1, min_x2))
+    u_min_y = int(min(min_y1, min_y2))
+    u_max_x = int(max(max_x1, max_x2))
+    u_max_y = int(max(max_y1, max_y2))
+
+    w = u_max_x - u_min_x + 1
+    h = u_max_y - u_min_y + 1
+    if w <= 0 or h <= 0 or w > 8000 or h > 8000:
+        return 0.0
+
+    m1 = np.zeros((h, w), dtype=np.uint8)
+    m2 = np.zeros((h, w), dtype=np.uint8)
+
+    cv2.fillPoly(m1, [p1 - [u_min_x, u_min_y]], 1)
+    cv2.fillPoly(m2, [p2 - [u_min_x, u_min_y]], 1)
+
+    intersection = int(np.logical_and(m1, m2).sum())
+    union = int(np.logical_or(m1, m2).sum())
+    return float(intersection) / float(union) if union > 0 else 0.0
+
+
+def _parse_day2_predictions(data: Any) -> Dict[str, List[Any]]:
+    """
+    Normalizes Day 2 ground truth and prediction inputs into:
+    { "parchment_test": [obj1, obj2, ...], ... }
+    """
+    result = {}
+    if not data:
+        return result
+
+    if isinstance(data, dict):
+        if "images" in data and isinstance(data["images"], list):
+            data = data["images"]
+        else:
+            for k, v in data.items():
+                key = _normalize_image_key(k)
+                if isinstance(v, list):
+                    result[key] = v
+                elif isinstance(v, dict):
+                    objs = v.get("objects") or v.get("polygons") or v.get("masks") or [v]
+                    result[key] = objs
+
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = (
+                item.get("image_name")
+                or item.get("filename")
+                or item.get("file")
+                or item.get("image")
+                or item.get("name")
+            )
+            if not name:
+                continue
+            key = _normalize_image_key(name)
+            objs = item.get("objects") or item.get("polygons") or item.get("masks")
+            if objs is None:
+                if "polygon" in item or "segmentation" in item:
+                    objs = [item]
+                else:
+                    objs = []
+            result[key] = objs
+
+    return result
 
 
 def _extract_timings(
@@ -181,7 +318,7 @@ class SubmissionEvaluator:
         )
 
     # -------------------------------------------------------------
-    # DAY 2: Binary Object Masking (IoU >= 0.95, TP / FP / FN / F1)
+    # DAY 2: Object Masking & Counting (Hungarian Matching, IoU, Count Acc)
     # -------------------------------------------------------------
     def evaluate_day2(
         self,
@@ -193,72 +330,123 @@ class SubmissionEvaluator:
         iou_threshold: float = 0.95
     ) -> EvaluationScore:
         mean_p, mean_t, load_s, wall_s = _extract_timings(timings, benchmark, total_wall_time_s)
+        latency = wall_s if wall_s > 0 else (mean_t if mean_t > 0 else 0.0)
 
         # Parse Ground Truth JSON
         with open(ground_truth_path, mode="r", encoding="utf-8") as f:
             gt_data = json.load(f)
 
-        # Normalize ground truth to: {filename: [mask1, mask2, ...]}
-        gt_dict = self._normalize_mask_json(gt_data)
+        gt_dict = _parse_day2_predictions(gt_data)
+        pred_dict = _parse_day2_predictions(predictions_data) if predictions_data else {}
 
-        # Normalize predictions to: {filename: [mask1, mask2, ...]}
-        pred_dict = self._normalize_mask_json(predictions_data) if predictions_data else {}
+        total_gt_objects = 0
+        total_pred_objects = 0
+        per_image_count_scores = []
+        all_matched_ious = []
+        iou95_count = 0
+        iou90_count = 0
+        image_details = {}
 
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
-        matched_ious = []
+        for img_key, gt_objs in gt_dict.items():
+            # Extract valid polygons for ground truth
+            gt_polys = []
+            for obj in gt_objs:
+                p = extract_polygon(obj)
+                if p is not None:
+                    gt_polys.append(p)
 
-        for filename, gt_masks in gt_dict.items():
-            preds = pred_dict.get(filename, [])
-            # Convert to binary arrays
-            gt_binaries = [_mask_to_binary_array(m) for m in gt_masks]
-            pred_binaries = [_mask_to_binary_array(m) for m in preds]
+            pred_objs = pred_dict.get(img_key, [])
+            pred_polys = []
+            for obj in pred_objs:
+                p = extract_polygon(obj)
+                if p is not None:
+                    pred_polys.append(p)
 
-            # Compute pairwise IoU
-            matched_gt = set()
-            for p_idx, p_mask in enumerate(pred_binaries):
-                best_iou = 0.0
-                best_gt_idx = -1
-                for g_idx, g_mask in enumerate(gt_binaries):
-                    if g_idx in matched_gt:
-                        continue
-                    iou = _compute_mask_iou(p_mask, g_mask)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt_idx = g_idx
+            num_gt = len(gt_polys)
+            num_pred = len(pred_polys)
+            total_gt_objects += num_gt
+            total_pred_objects += num_pred
 
-                if best_iou >= iou_threshold and best_gt_idx != -1:
-                    total_tp += 1
-                    matched_gt.add(best_gt_idx)
-                    matched_ious.append(best_iou)
-                else:
-                    total_fp += 1
+            # Count accuracy for this image:
+            # max(0, (num_gt - abs(num_pred - num_gt)) / num_gt)
+            if num_gt > 0:
+                pic_score = max(0.0, float(num_gt - abs(num_pred - num_gt)) / float(num_gt))
+            else:
+                pic_score = 1.0 if num_pred == 0 else 0.0
+            per_image_count_scores.append(pic_score)
 
-            # Unmatched ground truth masks are False Negatives
-            total_fn += (len(gt_binaries) - len(matched_gt))
+            # Match polygons using Hungarian algorithm (scipy.optimize.linear_sum_assignment)
+            # Cost matrix shape: (num_pred, num_gt)
+            if num_pred > 0 and num_gt > 0:
+                cost_matrix = np.zeros((num_pred, num_gt), dtype=np.float32)
+                for i, p_poly in enumerate(pred_polys):
+                    for j, g_poly in enumerate(gt_polys):
+                        cost_matrix[i, j] = compute_polygon_iou(p_poly, g_poly)
 
-        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+                # linear_sum_assignment minimizes cost, so minimize -IoU
+                row_ind, col_ind = linear_sum_assignment(-cost_matrix)
+
+                gt_matched_iou = {j: 0.0 for j in range(num_gt)}
+                for r, c in zip(row_ind, col_ind):
+                    gt_matched_iou[c] = float(cost_matrix[r, c])
+
+                img_ious = list(gt_matched_iou.values())
+            else:
+                img_ious = [0.0] * num_gt
+
+            for iou in img_ious:
+                all_matched_ious.append(iou)
+                if iou >= 0.95:
+                    iou95_count += 1
+                if iou >= 0.90:
+                    iou90_count += 1
+
+            image_details[img_key] = {
+                "gt_count": num_gt,
+                "pred_count": num_pred,
+                "count_score": round(pic_score * 100.0, 2),
+                "matched_ious": [round(x, 4) for x in img_ious],
+                "mean_iou": round(float(np.mean(img_ious)), 4) if img_ious else 0.0
+            }
+
+        avg_count_acc = float(np.mean(per_image_count_scores)) * 100.0 if per_image_count_scores else 0.0
+        avg_iou = float(np.mean(all_matched_ious)) if all_matched_ious else 0.0
+
+        # Composite score: 50% count accuracy + 50% average IoU (scaled to 100)
+        composite = round(0.5 * avg_count_acc + 0.5 * (avg_iou * 100.0), 4)
+
+        # Standard binary detection metrics at iou_threshold
+        tp = sum(1 for iou in all_matched_ious if iou >= iou_threshold)
+        fp = max(0, total_pred_objects - tp)
+        fn = total_gt_objects - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        mean_iou = float(np.mean(matched_ious)) if matched_ious else 0.0
 
         return EvaluationScore(
             day=2,
             total_images=len(gt_dict),
-            tp=total_tp,
-            fp=total_fp,
-            fn=total_fn,
+            total_gt_objects=total_gt_objects,
+            total_pred_objects=total_pred_objects,
+            count_accuracy=round(avg_count_acc, 2),
+            iou95=iou95_count,
+            iou90=iou90_count,
+            iou_average=round(avg_iou, 4),
+            latency=round(latency, 4),
+            tp=tp,
+            fp=fp,
+            fn=fn,
             precision=round(float(precision), 4),
             recall=round(float(recall), 4),
             f1_score=round(float(f1), 4),
-            mean_iou=round(mean_iou, 4),
+            mean_iou=round(avg_iou, 4),
             iou_threshold=iou_threshold,
             mean_processing_seconds=mean_p,
             mean_total_seconds=mean_t,
             model_load_seconds=load_s,
             total_wall_time_s=wall_s,
-            composite_score=round(float(f1 * 100.0), 4)
+            composite_score=composite,
+            details={"per_image": image_details}
         )
 
     # -------------------------------------------------------------
