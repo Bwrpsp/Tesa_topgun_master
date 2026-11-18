@@ -221,7 +221,7 @@ class HighSpeedDownloader:
                 with zipfile.ZipFile(dest_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     for f in temp_dir.rglob("*"):
                         if f.is_file():
-                            zf.write(f, f.relative_to(temp_dir))
+                            zf.write(f, arcname=f.relative_to(temp_dir).as_posix())
 
                 if dest_zip_path.exists() and dest_zip_path.stat().st_size > 0:
                     return True, None

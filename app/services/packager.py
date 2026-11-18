@@ -5,6 +5,71 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 
+def safe_extract_zip(zip_path: Path, extract_dir: Path):
+    """
+    Safely extracts all files from a zip archive.
+    Normalizes Windows backslashes ('\\') in entry names to POSIX forward slashes ('/'),
+    ensuring correct directory hierarchies are created on all operating systems (Linux, macOS, Windows).
+    Guards against Zip Slip (directory traversal).
+    """
+    extract_dir = extract_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            # Replace backslashes with forward slashes
+            clean_name = member.filename.replace("\\", "/").strip()
+            # Strip leading slashes to prevent root-relative paths
+            clean_name = clean_name.lstrip("/")
+            if not clean_name:
+                continue
+
+            target_path = (extract_dir / clean_name).resolve()
+            # Security: Prevent Zip Slip (escaping extract_dir)
+            try:
+                target_path.relative_to(extract_dir)
+            except ValueError:
+                # Path escapes extract_dir
+                continue
+
+            if member.is_dir() or clean_name.endswith("/"):
+                target_path.mkdir(parents=True, exist_ok=True)
+            else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member, "r") as src, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+
+def normalize_extracted_paths(base_dir: Path):
+    """
+    On POSIX filesystems where filenames may contain literal backslashes
+    (e.g., 'TGR-46_day2\\infer.py' or 'TGR-46_day2\\weights\\model.bin'),
+    recursively moves and restructures them into their proper directory hierarchy.
+    """
+    if not base_dir.exists():
+        return
+    for root, dirs, files in os.walk(base_dir, topdown=False):
+        for name in files:
+            if "\\" in name:
+                full_path = Path(root) / name
+                parts = [p for p in name.replace("\\", "/").split("/") if p]
+                new_target = Path(root).joinpath(*parts)
+                if new_target != full_path:
+                    new_target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(full_path), str(new_target))
+        for name in dirs:
+            if "\\" in name:
+                full_path = Path(root) / name
+                parts = [p for p in name.replace("\\", "/").split("/") if p]
+                new_target = Path(root).joinpath(*parts)
+                if new_target != full_path:
+                    new_target.parent.mkdir(parents=True, exist_ok=True)
+                    if new_target.exists():
+                        for item in full_path.iterdir():
+                            shutil.move(str(item), str(new_target / item.name))
+                        full_path.rmdir()
+                    else:
+                        shutil.move(str(full_path), str(new_target))
+
+
 class SubmissionPackager:
     """
     Stage 2: Batch unpacks raw contestant zips, validates required files
@@ -19,7 +84,9 @@ class SubmissionPackager:
         Locates the directory containing infer.py. Contestants often zip either
         the contents directly or the parent folder containing them.
         """
-        for root, _, files in os.walk(extract_dir):
+        normalize_extracted_paths(extract_dir)
+        for root, dirs, files in os.walk(extract_dir):
+            dirs[:] = [d for d in dirs if d not in self.EXCLUDED_PATTERNS]
             if "infer.py" in files:
                 return Path(root)
         return None
@@ -56,7 +123,9 @@ class SubmissionPackager:
         """
         Creates a clean, normalized zip file with infer.py, requirements.txt,
         weights/, and all Python helper modules at root.
+        All entries are written with standard POSIX forward slashes.
         """
+        bundle_zip_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(bundle_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(sub_root):
                 # Filter out excluded directories
@@ -67,7 +136,8 @@ class SubmissionPackager:
                     if file in self.EXCLUDED_PATTERNS:
                         continue
                     file_path = Path(root) / file
-                    arcname = str(rel_root / file) if str(rel_root) != "." else file
+                    rel_path = (rel_root / file) if str(rel_root) != "." else Path(file)
+                    arcname = rel_path.as_posix()
                     zf.write(file_path, arcname=arcname)
 
     def process_team(self, team_id: str, raw_zip: Path, extract_base_dir: Path, bundles_dir: Path) -> Dict[str, any]:
@@ -79,8 +149,7 @@ class SubmissionPackager:
         extract_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            with zipfile.ZipFile(raw_zip, "r") as zf:
-                zf.extractall(extract_dir)
+            safe_extract_zip(raw_zip, extract_dir)
         except Exception as e:
             return {"team_id": team_id, "is_valid": False, "error": f"Failed to unzip raw archive: {e}"}
 
