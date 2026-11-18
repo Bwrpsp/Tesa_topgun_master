@@ -169,6 +169,57 @@ class QueueManager:
             self.jobs[day][job_id] = job
             return job
 
+    def load_leaderboard_jobs(self, day: int, leaderboard_csv: Path) -> Dict[str, Job]:
+        """
+        Loads all existing completed and failed jobs from final_leaderboard.csv into memory,
+        preserving ranks and existing evaluation scores.
+        """
+        if not leaderboard_csv.exists():
+            return {}
+
+        with self._lock:
+            if day not in self.jobs:
+                self.jobs[day] = {}
+
+            with open(leaderboard_csv, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+
+            for row in rows:
+                job_id = str(row.get("job_id", "")).strip()
+                if not job_id:
+                    continue
+
+                status_str = str(row.get("status", "")).strip().upper()
+                team_name = str(row.get("team_name", job_id)).strip()
+                err_msg = str(row.get("error_message", "")).strip() or None
+                slave_id = str(row.get("slave_id", "")).strip() or "N/A"
+                hw_report = self._parse_hardware_from_row(row)
+
+                if status_str == "COMPLETED":
+                    eval_score = self._parse_evaluation_from_row(row, day)
+                    status_enum = JobStatus.COMPLETED
+                else:
+                    eval_score = None
+                    status_enum = JobStatus.FAILED
+
+                # Only add if not already in memory, or if in memory but not completed
+                if job_id not in self.jobs[day] or self.jobs[day][job_id].status != JobStatus.COMPLETED:
+                    job = Job(
+                        job_id=job_id,
+                        day=day,
+                        team_name=team_name,
+                        bundle_path="",
+                        status=status_enum,
+                        assigned_slave=slave_id,
+                        error_message=err_msg,
+                        evaluation=eval_score,
+                        hardware_report=hw_report
+                    )
+                    self.jobs[day][job_id] = job
+
+            return self.jobs[day]
+
     def requeue_failed_from_leaderboard(
         self,
         day: int,

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from typing import Optional
 import uvicorn
 
 # Ensure master directory is on sys.path
@@ -61,7 +62,54 @@ def download_cli(day: int, parallel: bool = False, verbose: bool = True, skip_ex
             print("Failed details:", result["errors"])
 
 
-def prepare_cli(day: int):
+def prepare_cli(day: int, team_id: Optional[str] = None):
+    # Try communicating with running master server first
+    import httpx
+    if team_id:
+        endpoint_url = f"http://{settings.MASTER_HOST}:{settings.MASTER_PORT}/api/v1/admin/day/{day}/prepare/{team_id}"
+    else:
+        endpoint_url = f"http://{settings.MASTER_HOST}:{settings.MASTER_PORT}/api/v1/admin/day/{day}/prepare-queue"
+
+    try:
+        resp = httpx.post(endpoint_url, timeout=60.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            if team_id:
+                print(f"[Day {day}] Success! {data['message']}")
+                print(f"  - Job ID:         {data['job_id']}")
+                print(f"  - Team Name:      {data['team_name']}")
+                print(f"  - Bundle:         {data['bundle_path']}")
+                print(f"  - Weights Count:  {data.get('weights_count')} files ({data.get('weights_dir')})")
+                print(f"  - Queue Position: #{data['queue_position']} (Total in Queue: {data.get('total_queued_for_day')})")
+            else:
+                print(f"[Day {day}] Success! {data['message']}")
+                rep = data.get("package_report", {})
+                print(f"  - Valid Bundles:  {rep.get('valid')}")
+                print(f"  - Invalid:        {rep.get('invalid')}")
+                print(f"  - Enqueued Jobs:  {data.get('enqueued_jobs')}")
+            return
+        elif team_id:
+            print(f"[Master Error] HTTP {resp.status_code}: {resp.text}")
+            return
+    except Exception:
+        pass
+
+    # If server is not running, run directly
+    if team_id:
+        from app.routers.admin import prepare_single_team_and_enqueue
+        try:
+            data = prepare_single_team_and_enqueue(day=day, team_id=team_id)
+            print(f"[Day {day}] Success! {data['message']}")
+            print(f"  - Job ID:         {data['job_id']}")
+            print(f"  - Team Name:      {data['team_name']}")
+            print(f"  - Bundle:         {data['bundle_path']}")
+            print(f"  - Weights Count:  {data.get('weights_count')} files ({data.get('weights_dir')})")
+            print(f"  - Queue Position: #{data['queue_position']}")
+            print("\nNote: Master server was not running. Start it with 'python run_master.py serve' to serve slaves.")
+        except Exception as e:
+            print(f"[Prepare Failed] {e}")
+        return
+
     raw_dir = settings.get_raw_zips_dir(day)
     extracted_dir = settings.get_extracted_dir(day)
     bundles_dir = settings.get_bundles_dir(day)
@@ -73,6 +121,22 @@ def prepare_cli(day: int):
     for d in report["details"]:
         status_str = "VALID" if d["is_valid"] else f"INVALID ({d.get('error')})"
         print(f"  - {d['team_id']}: {status_str}")
+
+    team_names_map = {}
+    csv_path = settings.get_contestants_csv(day)
+    if csv_path.exists():
+        downloader_temp = HighSpeedDownloader()
+        for item in downloader_temp.parse_contestants_csv(csv_path):
+            tid = item["team_id"]
+            tname = item.get("team_name")
+            if tname and tname != tid:
+                team_names_map[tid] = f"{tname} ({tid})"
+            else:
+                team_names_map[tid] = tid
+
+    enqueued_count = queue_manager.load_jobs_from_bundles(day, bundles_dir, team_names_map)
+    print(f"[Day {day}] Enqueued {enqueued_count} jobs from bundles.")
+    print("\nNote: Master server was not running. Start it with 'python run_master.py serve' to serve slaves.")
 
 
 def retry_failed_cli(day: int):
@@ -149,6 +213,43 @@ def enqueue_cli(team_id: str, day: int, force: bool = True):
         print(f"[Enqueue Failed] {e}")
 
 
+def evaluate_predictions_cli(day: int, force: bool = False, team_id: Optional[str] = None):
+    import httpx
+
+    params = f"?force={str(force).lower()}"
+    if team_id:
+        params += f"&team_id={team_id}"
+    endpoint_url = f"http://{settings.MASTER_HOST}:{settings.MASTER_PORT}/api/v1/admin/day/{day}/evaluate-predictions{params}"
+    try:
+        resp = httpx.post(endpoint_url, timeout=120.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"[Day {day}] {data['message']}")
+            for ev in data.get("evaluated", []):
+                print(f"  + [EVALUATED] Rank #{ev.get('rank', '-')}: {ev['team_name']} ({ev['job_id']}) -> Composite Score: {ev['composite_score']}")
+            for sk in data.get("skipped", []):
+                print(f"  - [SKIPPED] {sk['file']} ({sk['team_id']}): {sk['reason']}")
+            for er in data.get("errors", []):
+                print(f"  ! [ERROR] {er['file']}: {er['error']}")
+            return
+    except Exception:
+        pass
+
+    # If server is not running, run directly
+    from app.routers.admin import evaluate_predictions_for_day
+    try:
+        data = evaluate_predictions_for_day(day=day, force=force, target_team_id=team_id)
+        print(f"[Day {day}] {data['message']}")
+        for ev in data.get("evaluated", []):
+            print(f"  + [EVALUATED] Rank #{ev.get('rank', '-')}: {ev['team_name']} ({ev['job_id']}) -> Composite Score: {ev['composite_score']}")
+        for sk in data.get("skipped", []):
+            print(f"  - [SKIPPED] {sk['file']} ({sk['team_id']}): {sk['reason']}")
+        for er in data.get("errors", []):
+            print(f"  ! [ERROR] {er['file']}: {er['error']}")
+    except Exception as e:
+        print(f"[Evaluation Failed] {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TESA Master Orchestrator CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -187,11 +288,24 @@ def main():
     # Prepare command
     prep_parser = subparsers.add_parser("prepare", help="Unpack, validate and prepare bundles")
     prep_parser.add_argument(
+        "team_id",
+        nargs="?",
+        default=None,
+        help="Optional team_id to prepare only 1 team (e.g. TGR-67)"
+    )
+    prep_parser.add_argument(
         "--day",
         type=int,
         choices=[1, 2, 3],
         default=settings.ACTIVE_DAY,
         help="Competition day"
+    )
+    prep_parser.add_argument(
+        "--team-id",
+        dest="team_id_opt",
+        type=str,
+        default=None,
+        help="Optional flag syntax for team_id (e.g. --team-id TGR-67)"
     )
 
     # Retry-failed command
@@ -225,6 +339,31 @@ def main():
         help="Do not reset job if already completed/queued"
     )
 
+    # Evaluate-predictions command
+    eval_pred_parser = subparsers.add_parser(
+        "evaluate-predictions",
+        help="Evaluate manual prediction files in results/day_{day}/predictions"
+    )
+    eval_pred_parser.add_argument(
+        "--day",
+        type=int,
+        choices=[1, 2, 3],
+        default=settings.ACTIVE_DAY,
+        help="Competition day (default: active day)"
+    )
+    eval_pred_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Re-evaluate even if team already has a completed score in final_leaderboard.csv"
+    )
+    eval_pred_parser.add_argument(
+        "--team-id",
+        type=str,
+        default=None,
+        help="Optional team_id to evaluate only a specific prediction file"
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -237,11 +376,14 @@ def main():
             skip_existing=args.skip_existing
         )
     elif args.command == "prepare":
-        prepare_cli(args.day)
+        team_id_val = args.team_id_opt or args.team_id
+        prepare_cli(day=args.day, team_id=team_id_val)
     elif args.command == "retry-failed":
         retry_failed_cli(args.day)
     elif args.command == "enqueue":
         enqueue_cli(team_id=args.team_id, day=args.day, force=not args.no_force)
+    elif args.command == "evaluate-predictions":
+        evaluate_predictions_cli(day=args.day, force=args.force, team_id=args.team_id)
 
 
 if __name__ == "__main__":
