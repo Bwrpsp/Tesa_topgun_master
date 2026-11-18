@@ -1,3 +1,4 @@
+from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
@@ -15,6 +16,12 @@ packager = SubmissionPackager()
 
 class SetActiveDayRequest(BaseModel):
     day: int
+
+
+class EnqueueTeamRequest(BaseModel):
+    team_id: str
+    day: Optional[int] = None
+    force: bool = True
 
 
 @router.post("/day/{day}/download-all")
@@ -190,3 +197,172 @@ async def get_overall_status():
             } for d in (1, 2, 3)
         }
     }
+
+
+def _resolve_and_enqueue_team(day: int, team_id: str, force: bool = True) -> Dict[str, Any]:
+    """
+    Core resolution logic for manually enqueuing a team:
+    1. Normalizes team_id (handles TGR-XX, team_XX, case insensitivity, prefixes, .zip).
+    2. Looks up team in contestants.csv for friendly name & download link.
+    3. Finds existing bundle in bundles/ or creates it from raw_zips/ or downloads on demand.
+    4. Enqueues job in queue_manager.
+    """
+    if day not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Day must be 1, 2, or 3")
+
+    raw_id = team_id.strip()
+    if not raw_id:
+        raise HTTPException(status_code=400, detail="team_id cannot be empty")
+
+    # Strip day prefixes if user entered e.g. day1_TGR-01
+    for pfx in (f"day{day}_", f"day_{day}_", "day1_", "day2_", "day3_"):
+        if raw_id.lower().startswith(pfx):
+            raw_id = raw_id[len(pfx):]
+            break
+
+    # Strip .zip extension if provided
+    if raw_id.lower().endswith(".zip"):
+        raw_id = raw_id[:-4]
+
+    canonical_team_id = raw_id
+    team_name = raw_id
+    contestant_item = None
+
+    # Check contestants.csv for friendly name and metadata
+    csv_path = settings.get_contestants_csv(day)
+    if csv_path.exists():
+        dl_temp = HighSpeedDownloader()
+        try:
+            contestants = dl_temp.parse_contestants_csv(csv_path)
+            for item in contestants:
+                tid = item.get("team_id", "").strip()
+                tname = item.get("team_name", "").strip()
+                if tid.lower() == raw_id.lower() or (tname and tname.lower() == raw_id.lower()):
+                    canonical_team_id = tid
+                    team_name = f"{tname} ({tid})" if tname and tname != tid else tid
+                    contestant_item = item
+                    break
+        except Exception as e:
+            print(f"[Warning] Error parsing contestants.csv: {e}")
+
+    bundles_dir = settings.get_bundles_dir(day)
+    bundle_file = bundles_dir / f"{canonical_team_id}.zip"
+
+    # Search for existing bundle (exact or case-insensitive)
+    if not bundle_file.exists():
+        matches = [f for f in bundles_dir.glob("*.zip") if f.stem.lower() == canonical_team_id.lower()]
+        if matches:
+            bundle_file = matches[0]
+            canonical_team_id = bundle_file.stem
+
+    # If bundle does not exist, check raw_zips or attempt on-demand download
+    if not bundle_file.exists():
+        raw_zips_dir = settings.get_raw_zips_dir(day)
+        raw_zip = raw_zips_dir / f"{canonical_team_id}.zip"
+        if not raw_zip.exists():
+            matches = [f for f in raw_zips_dir.glob("*.zip") if f.stem.lower() == canonical_team_id.lower()]
+            if matches:
+                raw_zip = matches[0]
+                canonical_team_id = raw_zip.stem
+
+        if raw_zip.exists():
+            extracted_dir = settings.get_extracted_dir(day)
+            res = packager.process_team(canonical_team_id, raw_zip, extracted_dir, bundles_dir)
+            if not res.get("is_valid"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Raw archive found for '{canonical_team_id}' but validation failed: {res.get('error')}"
+                )
+            bundle_file = Path(res["bundle_path"])
+        elif contestant_item and contestant_item.get("url"):
+            # Attempt on-demand download from contestants.csv link
+            downloader = HighSpeedDownloader(
+                max_concurrent=1,
+                timeout_seconds=settings.DOWNLOAD_TIMEOUT_SECONDS
+            )
+            tid, success, err = downloader._download_item(contestant_item, raw_zips_dir, verbose=True)
+            if not success:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not download submission for team '{canonical_team_id}': {err}"
+                )
+            raw_zip = raw_zips_dir / f"{canonical_team_id}.zip"
+            extracted_dir = settings.get_extracted_dir(day)
+            res = packager.process_team(canonical_team_id, raw_zip, extracted_dir, bundles_dir)
+            if not res.get("is_valid"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Downloaded archive for '{canonical_team_id}' but validation failed: {res.get('error')}"
+                )
+            bundle_file = Path(res["bundle_path"])
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Bundle for team '{canonical_team_id}' not found in {bundles_dir}, raw archive not found in {raw_zips_dir}, and no download link found in contestants.csv."
+            )
+
+    # Enqueue job
+    job = queue_manager.enqueue_team_job(
+        day=day,
+        team_id=canonical_team_id,
+        bundle_path=str(bundle_file),
+        team_name=team_name,
+        force=force
+    )
+
+    queued_jobs = [j for j in queue_manager.jobs.get(day, {}).values() if j.status.value == "QUEUED"]
+    position = next((idx + 1 for idx, j in enumerate(queued_jobs) if j.job_id == job.job_id), len(queued_jobs))
+
+    return {
+        "message": f"Team '{canonical_team_id}' successfully enqueued for Day {day}",
+        "job_id": job.job_id,
+        "day": day,
+        "team_id": canonical_team_id,
+        "team_name": job.team_name,
+        "bundle_path": str(bundle_file),
+        "status": job.status.value,
+        "queue_position": position,
+        "total_queued_for_day": len(queued_jobs)
+    }
+
+
+@router.post("/queue/enqueue-team")
+@router.post("/enqueue-team")
+async def enqueue_team_endpoint(
+    req: Optional[EnqueueTeamRequest] = None,
+    team_id: Optional[str] = Query(None, description="Team ID from contestants.csv (e.g. TGR-01)"),
+    day: Optional[int] = Query(None, description="Competition day (defaults to ACTIVE_DAY)"),
+    force: bool = Query(True, description="Force re-enqueue even if previously evaluated")
+):
+    """
+    Manually adds a team to the job queue using their team_id (e.g. 'TGR-01', 'TGR-23').
+    Accepts input via JSON request body or URL query parameters.
+    """
+    target_team = req.team_id if (req and req.team_id) else team_id
+    if not target_team:
+        raise HTTPException(
+            status_code=400,
+            detail="team_id must be provided in request body ({'team_id': 'TGR-01'}) or query parameter (?team_id=TGR-01)"
+        )
+
+    target_day = req.day if (req and req.day is not None) else day
+    if target_day is None:
+        target_day = settings.ACTIVE_DAY
+
+    target_force = req.force if req else force
+    return _resolve_and_enqueue_team(day=target_day, team_id=target_team, force=target_force)
+
+
+@router.post("/day/{day}/enqueue/{team_id}")
+@router.get("/day/{day}/enqueue/{team_id}")
+async def enqueue_team_by_path(
+    day: int,
+    team_id: str,
+    force: bool = Query(True, description="Force re-enqueue even if previously evaluated")
+):
+    """
+    Direct path endpoint to manually add a team to the queue:
+    POST or GET /api/v1/admin/day/{day}/enqueue/{team_id}
+    Example: /api/v1/admin/day/1/enqueue/TGR-01
+    """
+    return _resolve_and_enqueue_team(day=day, team_id=team_id, force=force)

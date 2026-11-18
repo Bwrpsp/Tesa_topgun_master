@@ -130,6 +130,45 @@ class QueueManager:
                 added_count += 1
             return added_count
 
+    def enqueue_team_job(
+        self,
+        day: int,
+        team_id: str,
+        bundle_path: str,
+        team_name: Optional[str] = None,
+        force: bool = True
+    ) -> Job:
+        """
+        Manually enqueues (or re-enqueues) a single team job into the queue for the specified day.
+        If force=True, resets any existing job status (even if COMPLETED or FAILED) to QUEUED.
+        """
+        with self._lock:
+            if day not in self.jobs:
+                self.jobs[day] = {}
+
+            job_id = f"day{day}_{team_id}"
+
+            if not force and job_id in self.jobs[day] and self.jobs[day][job_id].status == JobStatus.QUEUED:
+                return self.jobs[day][job_id]
+
+            job = Job(
+                job_id=job_id,
+                day=day,
+                team_name=team_name or team_id,
+                bundle_path=str(bundle_path),
+                status=JobStatus.QUEUED,
+                assigned_slave=None,
+                assigned_at=None,
+                completed_at=None,
+                error_message=None,
+                evaluation=None,
+                hardware_report=None
+            )
+            # Re-insert at end of queue
+            self.jobs[day].pop(job_id, None)
+            self.jobs[day][job_id] = job
+            return job
+
     def requeue_failed_from_leaderboard(
         self,
         day: int,

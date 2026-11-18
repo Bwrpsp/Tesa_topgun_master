@@ -113,6 +113,42 @@ def retry_failed_cli(day: int):
     print("\nNote: Master server was not running. Start it with 'python run_master.py serve' to serve slaves.")
 
 
+def enqueue_cli(team_id: str, day: int, force: bool = True):
+    from app.routers.admin import _resolve_and_enqueue_team
+    import httpx
+
+    # Try communicating with running master server first
+    endpoint_url = f"http://{settings.MASTER_HOST}:{settings.MASTER_PORT}/api/v1/admin/day/{day}/enqueue/{team_id}?force={str(force).lower()}"
+    try:
+        resp = httpx.post(endpoint_url, timeout=15.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"[Day {day}] Success! Enqueued '{data['team_id']}' into running Master Server.")
+            print(f"  - Job ID:         {data['job_id']}")
+            print(f"  - Team Name:      {data['team_name']}")
+            print(f"  - Status:         {data['status']}")
+            print(f"  - Queue Position: #{data['queue_position']} (Total in Queue: {data['total_queued_for_day']})")
+            return
+        else:
+            print(f"[Master Error] HTTP {resp.status_code}: {resp.text}")
+            return
+    except Exception:
+        pass
+
+    # If server is not running, run directly against queue_manager
+    try:
+        data = _resolve_and_enqueue_team(day=day, team_id=team_id, force=force)
+        print(f"[Day {day}] Success! Enqueued '{data['team_id']}'.")
+        print(f"  - Job ID:         {data['job_id']}")
+        print(f"  - Team Name:      {data['team_name']}")
+        print(f"  - Status:         {data['status']}")
+        print(f"  - Bundle:         {data['bundle_path']}")
+        print(f"  - Queue Position: #{data['queue_position']}")
+        print("\nNote: Master server was not running. Start it with 'python run_master.py serve' to serve slaves.")
+    except Exception as e:
+        print(f"[Enqueue Failed] {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TESA Master Orchestrator CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -168,6 +204,27 @@ def main():
         help="Competition day (default: 1)"
     )
 
+    # Enqueue single team command
+    enq_parser = subparsers.add_parser("enqueue", help="Manually enqueue a specific team (e.g. TGR-01)")
+    enq_parser.add_argument(
+        "team_id",
+        type=str,
+        help="Team ID from contestants.csv (e.g. TGR-01, TGR-23)"
+    )
+    enq_parser.add_argument(
+        "--day",
+        type=int,
+        choices=[1, 2, 3],
+        default=settings.ACTIVE_DAY,
+        help="Competition day (default: active day)"
+    )
+    enq_parser.add_argument(
+        "--no-force",
+        action="store_true",
+        default=False,
+        help="Do not reset job if already completed/queued"
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -183,6 +240,8 @@ def main():
         prepare_cli(args.day)
     elif args.command == "retry-failed":
         retry_failed_cli(args.day)
+    elif args.command == "enqueue":
+        enqueue_cli(team_id=args.team_id, day=args.day, force=not args.no_force)
 
 
 if __name__ == "__main__":
